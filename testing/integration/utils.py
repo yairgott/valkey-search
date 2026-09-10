@@ -60,13 +60,20 @@ def start_valkey_process(
     modules: dict[str, str],
     password: str | None = None,
 ) -> ValkeyServerUnderTest:
-    command = f"{valkey_server_path} --port {port} --dir {directory}"
-    modules_args = [f'"--loadmodule {k} {v}"' for k, v in modules.items()]
-    args_str = " ".join([f"--{k} {v}" for k, v in args.items()] + modules_args)
-    command += " --loadmodule " + os.environ["VALKEY_JSON_PATH"]
-    command += " " + args_str
-    command = "ulimit -c unlimited && " + command
-    logging.info("Starting valkey process with command: %s", command)
+    conf_path = os.path.join(directory, f"valkey_{port}.conf")
+    with open(conf_path, "w") as f:
+        f.write(f"port {port}\n")
+        f.write(f"dir {directory}\n")
+        if password:
+            f.write(f"requirepass {password}\n")
+        for k, v in args.items():
+            f.write(f"{k} {v}\n")
+        f.write(f"loadmodule {os.environ['VALKEY_JSON_PATH']}\n")
+        for k, v in modules.items():
+            f.write(f"loadmodule {k} {v}\n")
+
+    command = f"ulimit -c unlimited && {valkey_server_path} {conf_path}"
+    logging.info("Starting valkey process with config: %s", conf_path)
 
     process = subprocess.Popen(
         command, shell=True, stdout=stdout_file, stderr=stdout_file
@@ -197,6 +204,7 @@ def start_valkey_cluster(
 
         timeout = 60
         now = time.time()
+        cluster_created = False
         while time.time() - now < timeout:
             try:
                 subprocess.run(
@@ -205,9 +213,15 @@ def start_valkey_cluster(
                     stdout=cli_stdout_file,
                     stderr=cli_stdout_file,
                 )
+                cluster_created = True
                 break
             except subprocess.CalledProcessError:
                 time.sleep(1)
+
+        if not cluster_created:
+            raise RuntimeError(
+                f"Failed to create valkey cluster within {timeout}s. Check {cli_stdout_path}"
+            )
 
     # This is also ugly, but we need to wait for the cluster to be ready. There
     # doesn't seem to be a way to do that with the valkey-server, since it seems to
@@ -1143,7 +1157,10 @@ def connect_to_valkey_cluster(
             )
             valkey_conn.ping()
             return valkey_conn
-        except valkey.exceptions.ConnectionError as e:
+        except (
+            valkey.exceptions.ConnectionError,
+            valkey.exceptions.ValkeyClusterException,
+        ) as e:
             if attempts == 0:
                 raise e
             logging.info("Failed to connect to valkey cluster, retrying...")
